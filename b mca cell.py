@@ -446,7 +446,6 @@ class CurveletMaskedAttention(nn.Module):
         k = self.k_proj(ky)
         v = self.v_proj(ky)
 
-        # 一次attention，不是Wn次
         head_dim = self.attn_dim // self.num_heads
         q_in = q.view(B, HW, self.num_heads, head_dim).transpose(1, 2)
         k_in = k.view(B, HW, self.num_heads, head_dim).transpose(1, 2)
@@ -455,13 +454,11 @@ class CurveletMaskedAttention(nn.Module):
         out = F.scaled_dot_product_attention(q_in, k_in, v_in)  # [B, num_heads, HW, head_dim]
         out = out.transpose(1, 2).reshape(B, HW, self.attn_dim)  # [B, HW, D]
 
-        # 投影回[B, Cz, Wn, H, W]
         # print(out.shape)
         out = self.out_proj(out)  # [B, HW, Cz*Wn]
         # print(out.shape)
-        out = out.reshape(B, H, W, Cz, Wn).permute(0, 3, 4, 1, 2).contiguous()
+        out = out.reshape(B, H, W, Cz, Wn).permute(0, 3, 4, 1, 2).contiguous() # [B, Cz, Wn, H, W]
 
-        # residual：z直接加
         return out + z
 
     def _masked_spectral_attn(
