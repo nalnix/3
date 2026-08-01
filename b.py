@@ -1,13 +1,21 @@
 """
 CurveletINR Architecture
-1. Y  -> FDCT -> coarse_y [HR], wedge_y [B, Cy_ri, Wn, H, W]
-2. Z  -> SpectralAttention4D -> z_guide [B, Cz, h, w]
-3. coarse_y + z_guide -> CoarseINR -> coarse_x [B, Cz, H, W]
-4. wedge_y + z_guide + w_emb -> WedgeZAttention -> wedge_z [B, Cz_ri, Wn, h, w]
-5. wedge_z (LR) + aggregated wedge_y (HR) -> WedgeINR -> wedge_x [B, Cz_ri, Wn, H, W]
-6. coarse_x + wedge_x -> IFDCT -> X_rec
+Y->FDCT->coarse_y, wedge_y
+       ->wedge_idx->wedge physical embedding->w_emb
+Z->spectral attn->low pass filtering->coarse_z
+                                    ->wedge z attn->wedge_z
+coarse_y, coarse_z->coarseINR->coarse_x->
+wedge_y, wedge_z, w_emb->wedgeINR->wedge_x->IFDCT->x
 """
-#edited
+
+# PREVIOUS EDITION (lkw):
+# comparatively high SAM (leading to low PSNR, high ERGAS, high RMSE)
+# high aggregation weight?(0.9-1.1)
+# lissajous-like pattern in fusion image?
+
+# NEW EDITION (pa):
+# move spectral self attention before filtering
+# type error detail_z=Z-coarse_z proven valid
 
 import math
 from typing import Dict, List, Tuple
@@ -18,6 +26,39 @@ from torch import Tensor
 
 from model.module.fe_block import make_coord, MLP
 from model.base_model import BaseModel, register_model
+
+import matplotlib.pyplot as plt
+
+def vis_weight(w:Tensor):
+    weight=w.detach().cpu().numpy()
+    fig, ax = plt.subplots(figsize=(8, 10))
+    im = ax.imshow(weight, aspect='auto', cmap='viridis',vmax=1)
+
+    # 添加颜色条
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label('Weight Value')
+
+    # 设置坐标轴标签
+    ax.set_xlabel('Feature Index')
+    ax.set_ylabel('Sample / Neuron Index')
+    ax.set_title('Weight Matrix Heatmap (24×5)')
+    plt.tight_layout()
+    plt.show()
+    plt.savefig(f'./weight.png', dpi=150)
+    plt.close()
+
+def vis_spectrum(x: Tensor,name='x',is_wedge=False):
+    if is_wedge:
+        x=x.sum(dim=1)
+        B,C,H,W = x.shape
+        spec = torch.fft.fft2(x[0, 0]).abs().log1p().cpu()
+    else:
+        spec = torch.fft.fft2(x[0, 0]).abs().log1p().cpu()
+    plt.figure()
+    plt.imshow(torch.fft.fftshift(spec).numpy(),cmap='hot',vmax=7)
+    plt.colorbar()
+    plt.savefig(f'./{name}_spec.png', dpi=150)
+    plt.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FDCT Implementation (Window Cache & Fast Processing)
@@ -127,6 +168,7 @@ def ifdct2d(coeffs: list[list[Tensor]], output_shape: tuple[int, int, int, int])
             idx, val = win_info['idx'], win_info['val'].to(cdtype)
             up_fft = torch.fft.fft2(coeff.to(cdtype), norm="ortho")
             X_rec.reshape(B, C, -1)[:, :, idx] += up_fft.reshape(B, C, -1)[:, :, idx] * val
+
     x_rec = torch.fft.ifft2(X_rec, norm="ortho").real
     return x_rec.to(dtype if not dtype.is_complex else torch.float32)
 
@@ -188,12 +230,11 @@ def _wrap_n(s, n, num_angles_coarse):
 #     return s2, _wedge_wrap_n(s2, n, num_angles_coarse)
 
 _ANGULAR_NEIGHBOR_CACHE: dict = {}   # for WedgeZAttention
-_CHILD_NEIGHBOR_CACHE:   dict = {}   # for WedgeINR
 
 def build_neighbor_indices(wedge_index, num_scales, num_angles_coarse, device):
     """
     Build and cache both neighbor index matrices for a given wedge_index.
-    Returns (angular_idx, child_idx), each [Wn, 5].
+    Returns angular_idx, [Wn, 5].
 
     Angular neighbor order (for WedgeZAttention):
       0: self          (s,   n)
@@ -201,54 +242,48 @@ def build_neighbor_indices(wedge_index, num_scales, num_angles_coarse, device):
       2: angular right (s,   n+1)
       3: child         (s+1, 2n)
       4: parent        (s-1, n//2)
-
-    Child neighbor order (for WedgeINR):
-      0: self          (s,   n)
-      1: child left    (s+1, wrap(2n-1))
-      2: child right   (s+1, wrap(2n+1))
-      3: child center  (s+1, 2n)
-      4: parent        (s-1, n//2)
     """
     key = tuple(wedge_index)
     if key not in _ANGULAR_NEIGHBOR_CACHE:
         wi_map = {wn: i for i, wn in enumerate(wedge_index)}
         Wn = len(wedge_index)
         ang = torch.zeros(Wn, 5, dtype=torch.long)
-        cld = torch.zeros(Wn, 5, dtype=torch.long)
         for i, (s, n) in enumerate(wedge_index):
             if s==0:
                 ang_nb = [(s,n),(s,_wrap_n(s, n - 1, num_angles_coarse)),(s, _wrap_n(s, n + 1, num_angles_coarse)),(s+1,2*n),(s,n)]
-                cld_nb = [(s,n),(s+1, _wrap_n(s + 1, 2 * n - 1, num_angles_coarse)),(s + 1, _wrap_n(s + 1, 2 * n + 1, num_angles_coarse)),(s + 1, 2 * n),(s,n)]
             elif s==num_scales-1:
                 ang_nb = [(s,n),(s, _wrap_n(s, n - 1, num_angles_coarse)),(s, _wrap_n(s, n + 1, num_angles_coarse)),(s,n),(s-1, n // 2)]
-                cld_nb = [(s,n),(s,n),(s,n),(s,n),(s-1, n // 2)]
             else:
                 ang_nb = [(s,n),(s, _wrap_n(s, n - 1, num_angles_coarse)),(s, _wrap_n(s, n + 1, num_angles_coarse)),(s + 1, 2 * n),(s - 1, n // 2)]
-                cld_nb = [(s,n),(s + 1, _wrap_n(s + 1, 2 * n - 1, num_angles_coarse)),(s + 1, _wrap_n(s + 1, 2 * n + 1, num_angles_coarse)),(s + 1, 2 * n),(s - 1, n // 2)]
 
             for k, wn in enumerate(ang_nb): ang[i, k] = wi_map.get(wn, i)
-            for k, wn in enumerate(cld_nb): cld[i, k] = wi_map.get(wn, i)
-        _ANGULAR_NEIGHBOR_CACHE[key] = ang.to(device)
-        _CHILD_NEIGHBOR_CACHE[key]   = cld.to(device)
 
-    return _ANGULAR_NEIGHBOR_CACHE[key], _CHILD_NEIGHBOR_CACHE[key]
+        _ANGULAR_NEIGHBOR_CACHE[key] = ang.to(device)
+
+
+    return _ANGULAR_NEIGHBOR_CACHE[key]
 
 @staticmethod
-def weighted_agg(feat, idx, w):
+def weighted_agg(feat, idx, w, scale):
     """
     Neighbor-weighted aggregation.
       feat : [B, Wn, hw, D]
       idx  : [Wn, K]
       w    : [Wn, K]  raw logits -> softmax inside
+      scale: [K]      per neighbor scaling factor
     returns: [B, Wn, hw, D]
     """
     B, Wn, hw, D = feat.shape
     K = idx.shape[1]
     nb = feat[:, idx.reshape(-1), :, :]   # [B, Wn*K, hw, D]
     nb = nb.reshape(B, Wn, K, hw, D)
-    w  = w.softmax(dim=-1)                # [Wn, K]
-    w  = w[None, :, :, None, None]        # [1, Wn, K, 1, 1]
-    return (nb * w).sum(dim=2)            # [B, Wn, hw, D]
+    self_nb = nb[:,:,0]                   # [B, Wn, hw, D]
+    # w  = w.softmax(dim=-1)                # [Wn, K]
+    w = scale * torch.sigmoid(w)         #range from 0 to scale(initialized as 0.5*0.01)
+    # vis_weight(w)
+
+    w = w[None, :, :, None, None]        # [1, Wn, K, 1, 1]
+    return (nb * w).sum(dim=2)+self_nb   # [B, Wn, hw, D]
 
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model=2, max_len=4096):
@@ -314,11 +349,15 @@ class WedgeZAttention(nn.Module):
         self.d_head = d_head
 
         # neighbor aggregation weights (shared for K and V)
+        self.base_scale = nn.Parameter(torch.full((5,), 0.01))
+        self.scale_mod = nn.Linear(1, 5, bias=False)
+        nn.init.constant_(self.scale_mod.weight, 0.0)
+        
         # self.nb_w = nn.Linear(embed_dim, nb_K)
         self.nb_w = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2),
+            nn.Linear(embed_dim * 2, embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim * 2, nb_K)
+            nn.Linear(embed_dim, 1)
         )
         nn.init.zeros_(self.nb_w[-1].weight)
         nn.init.zeros_(self.nb_w[-1].bias)
@@ -327,7 +366,12 @@ class WedgeZAttention(nn.Module):
         self.Wq = nn.Linear(Cz, d_head)
 
         # K: from aggregated [wedge_y_ds, w_emb]
-        self.Wk = nn.Linear(Cy_ri + embed_dim, d_head)
+        self.Wk_A = nn.Linear(Cy_ri + embed_dim, d_head)
+        # self.Wk_A   = nn.Linear(Cy_ri , d_head)
+        self.Wk_phi = nn.Linear(Cy_ri + embed_dim, d_head)
+
+        nn.init.constant_(self.Wk_A.bias,   -2.0)   # sigmoid(-2) ≈ 0.12
+        nn.init.constant_(self.Wk_phi.bias, -2.0)
 
         # V: two heads (A and phi), from aggregated [wedge_y_ds, z]
         self.Wv_A   = nn.Linear(Cy_ri + Cz, Cz)
@@ -344,16 +388,22 @@ class WedgeZAttention(nn.Module):
         _, Cz, h, w = z.shape
         d = self.d_head
         device = z.device
+        ds_ratio = H / h
 
-        nb_idx, _ = build_neighbor_indices(
+        nb_idx = build_neighbor_indices(
             wedge_index, self.num_scales, self.num_angles_coarse, device) # [Wn, nb_K]
 
         # --- downsample wedge_y from (H,W) to (h,w) ---
         # reshape to 4D for interpolate, then restore Wn dim
-        wy_ds = F.interpolate(
-            wedge_y.reshape(B * Wn, Cy_ri, H, W),
-            size=(h, w), mode='bilinear', align_corners=False
-        ).reshape(B, Wn, Cy_ri, h, w)              # [B, Wn, Cy_ri, h, w]
+        wy_ds = F.adaptive_avg_pool2d(
+            wedge_y.reshape(B * Wn, Cy_ri, H, W), 
+            output_size=(h, w)
+            ).reshape(B, Wn, Cy_ri, h, w)
+
+        # wy_ds = F.interpolate(
+        #     wedge_y.reshape(B * Wn, Cy_ri, H, W),
+        #     size=(h, w), mode='bilinear', align_corners=False
+        # ).reshape(B, Wn, Cy_ri, h, w)              # [B, Wn, Cy_ri, h, w]
 
         # layout: [B, Wn, hw, D]
         wy  = wy_ds.permute(0, 1, 3, 4, 2).reshape(B, Wn, h * w, Cy_ri)
@@ -364,19 +414,31 @@ class WedgeZAttention(nn.Module):
         # ================================================================
         # Step 1: neighbor weighted aggregation -> K_agg, V_agg
         # ================================================================
-        nb_w = self.nb_w(w_emb)                                        # [Wn, nb_K]
+        # nb_w = self.nb_w(w_emb)                                        # [Wn, nb_K]
+        nb_emb   = w_emb[nb_idx.reshape(-1)].reshape(Wn, self.nb_K, -1)   # [Wn, K, emb]
+        self_emb = w_emb[:, None, :].expand(Wn, self.nb_K, -1)             # [Wn, K, emb]
+        pair     = torch.cat([self_emb - nb_emb, self_emb], dim=-1)         # [Wn, K, emb*2]
+        nb_w     = self.nb_w(pair).squeeze(-1)                              # [Wn, K]
+        
+        # scale=0.01
+        ds_tensor = torch.tensor([math.log2(ds_ratio)], device=device, dtype=torch.float32)
+        # 用 tanh 限制调制范围在 [-1,1]，然后映射到 [0,1]
+        mod = torch.tanh(self.scale_mod(ds_tensor)) * 0.5 + 0.5   # [1, 5]
+        scale = self.base_scale * mod.squeeze(0)                  # [5]
 
         k_in  = torch.cat([wy, fe], dim=-1)                            # [B, Wn, hw, Cy_ri+emb]
-        K_agg = weighted_agg(k_in, nb_idx, nb_w)                        # [B, Wn, hw, Cy_ri+emb]
+        K_agg = weighted_agg(k_in, nb_idx, nb_w, scale)                        # [B, Wn, hw, Cy_ri+emb]
 
         v_in  = torch.cat([wy, z_wn], dim=-1)                          # [B, Wn, hw, Cy_ri+Cz]
-        V_agg = weighted_agg(v_in, nb_idx, nb_w)                       # [B, Wn, hw, Cy_ri+Cz]
+        V_agg = weighted_agg(v_in, nb_idx, nb_w, scale)                       # [B, Wn, hw, Cy_ri+Cz]
 
         # ================================================================
         # Step 2: project -> Q, K, Va, Vp
         # ================================================================
         Q  = self.Wq(z_flat)        # [B, hw, d]
-        K  = self.Wk(K_agg)         # [B, Wn, hw, d]
+        # Ka   = self.Wk_A(K_agg[:, :, :, :Cy_ri])     # [B, Wn, hw, d]
+        Ka   = self.Wk_A(K_agg)     # [B, Wn, hw, d]
+        Kp = self.Wk_phi(K_agg)   # [B, Wn, hw, d]
         Va = self.Wv_A(V_agg)       # [B, Wn, hw, Cz]
         Vp = self.Wv_phi(V_agg)     # [B, Wn, hw, Cz]
 
@@ -385,18 +447,20 @@ class WedgeZAttention(nn.Module):
         # softmax over Wn: "which wedge matters for this LR pixel"
         # ================================================================
         Q_exp = Q[:, None, :, :]                                       # [B, 1,  hw, d]
-        score = (Q_exp * K).sum(-1) / (d ** 0.5)                      # [B, Wn, hw]
-        attn  = score.softmax(dim=1)                                   # [B, Wn, hw]
+        score_A = (Q_exp * Ka).sum(-1) / (d ** 0.5)                   # [B, Wn, hw]
+        score_p = (Q_exp * Kp).sum(-1) / (d ** 0.5)                   # [B, Wn, hw]
+        attn_A  = torch.sigmoid(score_A)                               # [B, Wn, hw]
+        attn_p  = torch.sigmoid(score_p)                               # [B, Wn, hw]
 
         # ================================================================
         # Step 4: amplitude-phase modulation on z
         # ================================================================
-        attn_exp = attn[:, :, :, None]                                 # [B, Wn, hw, 1]
-        out_a = attn_exp * Va                                          # [B, Wn, hw, Cz]
-        out_p = attn_exp * Vp                                          # [B, Wn, hw, Cz]
+        out_a = attn_A[:, :, :, None] * Va                            # [B, Wn, hw, Cz]
+        out_p = attn_p[:, :, :, None] * Vp                            # [B, Wn, hw, Cz]                                     # [B, Wn, hw, Cz]
 
         A   = F.softplus(out_a)                                        # > 0
-        phi = out_p
+        # phi = out_p
+        phi=torch.pi*torch.tanh(out_p)                             # [-pi, pi]
 
         re = A * z_wn * torch.cos(phi)                                 # [B, Wn, hw, Cz]
         im = A * z_wn * torch.sin(phi)
@@ -433,6 +497,32 @@ class SpectralAttention4D(nn.Module):
         out = (attn @ v).view(B, C, H, W)
         return x + self.proj(out)
 
+class LearnableLowPassFilter(nn.Module):
+
+    def __init__(self, channels: int, kernel_size: int = 7):
+        super().__init__()
+        self.padding = kernel_size // 2
+        # 使用 groups=channels 确保只在空间域做滤波，不破坏原本的光谱通道独立性
+        self.conv = nn.Conv2d(channels, channels, kernel_size=kernel_size, 
+                              padding=self.padding, groups=channels, bias=False)
+        
+        # --- 赋予高斯低通初始先验 ---
+        sigma = kernel_size / 4.0  # 经验值，让高斯分布覆盖整个 kernel
+        coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = g / g.sum() # 归一化
+        kernel2d = g.view(-1, 1) * g.view(1, -1)
+        
+        # 扩展到所有通道: [channels, 1, kernel_size, kernel_size]
+        kernel2d = kernel2d.view(1, 1, kernel_size, kernel_size).repeat(channels, 1, 1, 1)
+        
+        # 将生成的权重赋给卷积层（它本身 requires_grad=True，因此是可学习的）
+        with torch.no_grad():
+            self.conv.weight.data.copy_(kernel2d)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.conv(x)
+
 class WedgeINR(nn.Module):
     def __init__(self, z_bands: int, y_bands: int, mlp_hidden: list = None,
                  pe_d_model: int = 2, embed_dim: int = 16, nb_K: int = 5,
@@ -449,14 +539,14 @@ class WedgeINR(nn.Module):
         out_dim = z_bands + 1       # z_bands = Cz*2; +1 for mixture weight
         self.mlp = MLP(in_dim, out_dim, mlp_hidden)
 
-        # INR neighbor weights: project w_emb -> [Wn, nb_K] logits
-        self.inr_nb_w = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2),
-            nn.GELU(),
-            nn.Linear(embed_dim * 2, nb_K),
-        )
-        nn.init.zeros_(self.inr_nb_w[-1].weight)
-        nn.init.zeros_(self.inr_nb_w[-1].bias)
+        # # INR neighbor weights: project w_emb -> [Wn, nb_K] logits
+        # self.inr_nb_w = nn.Sequential(
+        #     nn.Linear(embed_dim, embed_dim * 2),
+        #     nn.GELU(),
+        #     nn.Linear(embed_dim * 2, nb_K),
+        # )
+        # nn.init.zeros_(self.inr_nb_w[-1].weight)
+        # nn.init.zeros_(self.inr_nb_w[-1].bias)
 
     def forward(self, wedge_z: Tensor, wedge_y: Tensor,
                 wedge_index: list, w_emb: Tensor) -> Tensor:
@@ -485,14 +575,15 @@ class WedgeINR(nn.Module):
         q_y = F.grid_sample(y_flat, grid_y, mode='nearest', align_corners=False)\
                   [:, :, 0, :].permute(0, 2, 1)                        # [B*Wn, N, C_y]
 
-        # ── neighbor-aggregated q_y_agg (FDCT physical prior) ─────────────
-        # weighted_agg expects [B, Wn, hw, D]; reshape in/out accordingly
-        _, nb_idx = build_neighbor_indices(
-            wedge_index, self.num_scales, self.num_angles_coarse, device)
-        nb_w    = self.inr_nb_w(w_emb)                                 # [Wn, K]
-        q_y_4d  = q_y.reshape(B, Wn, N, C_y)                          # [B, Wn, N, C_y]
-        q_y_nb  = weighted_agg(q_y_4d, nb_idx, nb_w)                  # [B, Wn, N, C_y]
-        q_y_agg = (q_y_4d + q_y_nb).reshape(B * Wn, N, C_y)          # residual add
+        # # ── neighbor-aggregated q_y_agg (FDCT physical prior) ─────────────
+        # # weighted_agg expects [B, Wn, hw, D]; reshape in/out accordingly
+        # _, nb_idx = build_neighbor_indices(
+        #     wedge_index, self.num_scales, self.num_angles_coarse, device)
+        # nb_w    = self.inr_nb_w(w_emb)                                 # [Wn, K]
+        # # print(nb_w.softmax(dim=-1))
+        # q_y_4d  = q_y.reshape(B, Wn, N, C_y)                          # [B, Wn, N, C_y]
+        # q_y_nb  = weighted_agg(q_y_4d, nb_idx, nb_w)                  # [B, Wn, N, C_y]
+        # q_y_agg = (q_y_4d + q_y_nb).reshape(B * Wn, N, C_y)          # residual add
 
         # ── 4-corner LFC mixture (unchanged) ─────────────────────────────
         preds = []
@@ -507,7 +598,7 @@ class WedgeINR(nn.Module):
                 q_coord = F.grid_sample(feat_coord, grid_z, mode='nearest', align_corners=False)\
                               [:, :, 0, :].permute(0, 2, 1)
                 rel_coord = self.pe((coord - q_coord) * torch.tensor([h, w], device=device))
-                inp  = torch.cat([q_z, q_y_agg, rel_coord], dim=-1)   # q_y -> q_y_agg
+                inp  = torch.cat([q_z, q_y, rel_coord], dim=-1) 
                 pred = self.mlp(inp.view(B * Wn * N, -1)).view(B * Wn, N, -1)
                 preds.append(pred)
 
@@ -518,14 +609,17 @@ class WedgeINR(nn.Module):
         return out.view(B, Wn, H, W, C_z).permute(0, 4, 1, 2, 3)      # [B, C_z, Wn, H, W]
 
 class CoarseINR(nn.Module):
-    # (逻辑与原版基本一致，专门负责低频部分的插值和融合)
-    def __init__(self, z_bands: int, y_bands: int, mlp_hidden: list = None, pe_d_model: int = 2):
+    # 针对 3x3 local ensemble, bilinear 采样以及无 PE 版本的插值和融合
+    def __init__(self, z_bands: int, y_bands: int, mlp_hidden: list = None, pe_d_model: int = 0):
         super().__init__()
         if mlp_hidden is None: mlp_hidden = [256, 128]
-        self.pe = PositionalEmbedding(pe_d_model)
-        coord_dim = 2 * (2 * pe_d_model + 1)
+        
+        # pe_d_model 改为了 0，不再使用 Positional Embedding
+        # 此时输入的坐标只有相对 x 和 y，因此维度恒为 2
+        coord_dim = 2 
         in_dim  = z_bands + y_bands + coord_dim 
         out_dim = z_bands + 1
+        
         self.mlp = MLP(in_dim, out_dim, mlp_hidden)
  
     def forward(self, coarse_y: Tensor, coarse_z: Tensor) -> Tensor:
@@ -536,31 +630,57 @@ class CoarseINR(nn.Module):
  
         coord = make_coord((H, W)).unsqueeze(0).expand(B, -1, -1).to(device)
         feat_coord = make_coord((h, w), flatten=False).permute(2, 0, 1).unsqueeze(0).expand(B, -1, -1, -1).to(device)
-        rx, ry = 1.0 / h, 1.0 / w
+        
+        # 对于 3x3 邻域，偏移量应该是一整个特征图像素的距离
+        # 在 [-1, 1] 坐标系下，一个像素的宽度是 2.0 / size
+        rx, ry = 2.0 / h, 2.0 / w
  
         grid_y = coord.clone().flip(-1).unsqueeze(1)
-        q_y = F.grid_sample(coarse_y, grid_y, mode='nearest', align_corners=False)[:, :, 0, :].permute(0, 2, 1)
+        # grid_sample 模式改为 bilinear
+        q_y = F.grid_sample(coarse_y, grid_y, mode='bilinear', align_corners=False)[:, :, 0, :].permute(0, 2, 1)
  
         preds = []
-        for vx in [-1, 1]:
-            for vy in [-1, 1]:
+        # 改为 3x3 local ensemble (9 个邻域)
+        for vx in [-1, 0, 1]:
+            for vy in [-1, 0, 1]:
                 coord_ = coord.clone()
                 coord_[:, :, 0] += vx * rx
                 coord_[:, :, 1] += vy * ry
                 grid_z  = coord_.flip(-1).unsqueeze(1)
-                q_z     = F.grid_sample(coarse_z, grid_z, mode='nearest', align_corners=False)[:, :, 0, :].permute(0, 2, 1)
-                q_coord = F.grid_sample(feat_coord, grid_z, mode='nearest', align_corners=False)[:, :, 0, :].permute(0, 2, 1)
-                rel_coord = self.pe((coord - q_coord) * torch.tensor([h, w], device=device))
+                
+                # grid_sample 模式改为 bilinear
+                q_z     = F.grid_sample(coarse_z, grid_z, mode='bilinear', align_corners=False)[:, :, 0, :].permute(0, 2, 1)
+                q_coord = F.grid_sample(feat_coord, grid_z, mode='bilinear', align_corners=False)[:, :, 0, :].permute(0, 2, 1)
+                
+                # 取消了 self.pe，直接计算相对坐标并保持特征拼接
+                rel_coord = (coord - q_coord) * torch.tensor([h, w], device=device)
                 
                 inp  = torch.cat([q_z, q_y, rel_coord], dim=-1)
                 pred = self.mlp(inp.view(B * N, -1)).view(B, N, -1)
                 preds.append(pred)
  
+        # preds 经过 stack 之后，最后一个维度长度为 9
         preds  = torch.stack(preds, dim=-1)
+        # 对 9 个预测结果的权重进行 softmax 归一化
         weight = F.softmax(preds[:, :, -1, :], dim=-1)
+
+        # 加权融合
         out    = (preds[:, :, :-1, :] * weight.unsqueeze(-2)).sum(-1)
         return out.view(B, H, W, C_z).permute(0, 3, 1, 2)
 
+# class LowFreqFiLM(nn.Module):
+#     def __init__(self, z_bands: int, y_bands: int, hidden: int = 128):
+#         super().__init__()
+#         self.net = nn.Sequential(nn.Conv2d(z_bands + y_bands, hidden, 3, 1, 1), nn.ReLU(inplace=True),
+#                                  nn.Conv2d(hidden, hidden, 3, 1, 1), nn.ReLU(inplace=True))
+#         self.gamma_head = nn.Conv2d(hidden, z_bands, 1)
+#         self.beta_head = nn.Conv2d(hidden, z_bands, 1)
+
+#     def forward(self, coarse_y: Tensor, coarse_z_up: Tensor):
+#         feat = self.net(torch.cat([coarse_y, coarse_z_up], dim=1))
+#         gamma = self.gamma_head(feat) + 1.0
+#         beta = self.beta_head(feat)
+#         return gamma * coarse_z_up + beta
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main Model
@@ -577,6 +697,8 @@ class CuINR(BaseModel):
         self.num_scales, self.num_angles_coarse, self.scale = num_scales, num_angles_coarse, scale
 
         Cz_ri, Cy_ri = hsi_dim * 2, msi_dim * 2
+
+        self.z_lpf=LearnableLowPassFilter(channels=hsi_dim,kernel_size=7)
 
         # 1. Wedge physical embedding
         self.wedge_embed = WedgePhysicalEmbedding(num_scales, num_angles_coarse,
@@ -597,9 +719,10 @@ class CuINR(BaseModel):
                                    pe_d_model=pe_d_model, embed_dim=wedge_embed_dim,
                                    num_scales=num_scales, num_angles_coarse=num_angles_coarse)
 
-        # 5. Low-frequency Coarse INR
-        self.coarse_inr = CoarseINR(z_bands=hsi_dim, y_bands=msi_dim,
-                                     mlp_hidden=mlp_hidden, pe_d_model=pe_d_model)
+        # 5. Coarse INR：coarse_y (LR) + coarse_z (LR) -> coarse_x (LR)
+        self.coarse_inr = CoarseINR(z_bands=hsi_dim, y_bands=msi_dim, mlp_hidden=mlp_hidden, pe_d_model=0)
+        # # 5. Low-frequency FiLM
+        # self.low_freq_film = LowFreqFiLM(hsi_dim, msi_dim, film_hidden)
 
     def _fdct(self, x): return fdct2d(x, self.num_scales, self.num_angles_coarse)
     def _ifdct(self, coeffs, size): return ifdct2d(coeffs, size)
@@ -608,41 +731,34 @@ class CuINR(BaseModel):
         B, Cy, H, W = Y.shape
         _, Cz, h, w = Z.shape
 
-        # =======================================================
-        # Step 1: MSI (Y) frequency decomposition
-        # =======================================================
+        # 1. MSI decomposition
         CY = self._fdct(Y)
         coarse_y = CY[0][0]                                   # [B, Cy, H, W]
         wedge_y, wedge_index = stack_wedges(CY)               # [B, Cy_ri, Wn, H, W]
 
-        # =======================================================
-        # Step 2: HSI (Z) spectral feature extraction (stays LR)
-        # =======================================================
-        z_guide = self.z_spectral_attn(Z)                     # [B, Cz, h, w]
+        # 2. HSI low pass filtering
+        z_guide=self.z_spectral_attn(Z)
+        coarse_z=self.z_lpf(z_guide) #coarse[B,Cz,h,w]
+        detail_z=Z-coarse_z    #detail[B,Cz,h,w]
 
-        # =======================================================
-        # Step 3: Low-frequency coarse fusion
-        # =======================================================
-        coarse_x = self.coarse_inr(coarse_y, z_guide)         # [B, Cz, H, W]
+        # 3. coarse fusion
+        # z_up = F.interpolate(z_guide, size=(H, W), mode='bilinear', align_corners=False)
+        coarse_x = self.coarse_inr(coarse_y, coarse_z)         # [B, Cz, H, W]
 
-        # =======================================================
-        # Step 4: Build wedge_z (LR) via cross-attention
-        # =======================================================
+        # 4. build HSI wedge information through WedgeZAttention
         w_emb   = self.wedge_embed(wedge_index, device=Y.device)  # [Wn, embed_dim]
-        wedge_z = self.wedge_z_attn(wedge_y, z_guide, w_emb, wedge_index)
+        wedge_z = self.wedge_z_attn(wedge_y, detail_z, w_emb, wedge_index)
         # wedge_z: [B, Cz_ri, Wn, h, w]
 
-        # =======================================================
-        # Step 5: High-frequency INR super-resolution
-        # =======================================================
+        # 4. wedge fusion
         wedge_x = self.wedge_inr(wedge_z, wedge_y, wedge_index, w_emb)
-
-        # =======================================================
-        # Step 6: Reconstruction via IFDCT
-        # =======================================================
+        
+        # 5. fused image inverse transform
         CX_detail = unstack_wedges(wedge_x, CY, wedge_index)
         CX_detail[0] = [coarse_x.to(torch.complex64)]
-        return self._ifdct(CX_detail, (B, Cz, H, W))
+        X=self._ifdct(CX_detail, (B, Cz, H, W))
+
+        return X
 
     def train_step(self, ms, lms, pan, gt, criterion):
         sr = self._forward_implem(pan, lms, ms)
@@ -651,6 +767,31 @@ class CuINR(BaseModel):
 
     def val_step(self, ms, lms, pan):
         pred = self._forward_implem(pan, lms, ms)
+        return pred.clamp(0, 1)
+
+    def debug_step(self, ms, lms, pan, gt):
+        pred = self._forward_implem(pan, lms, ms)
+        vis_spectrum(gt)
+        CP = self._fdct(pred)
+        CG = self._fdct(gt)
+
+        loss=torch.nn.L1Loss()
+        coarse_loss = loss(CP[0][0], CG[0][0])
+        print(f"Coarse loss: {coarse_loss.item():.5f}")
+        wedge_pred, wedge_index = stack_wedges(CP)
+        wedge_gt, _   = stack_wedges(CG)
+        # # for s in range(self.num_scales):
+        # #     mask = [i for i, (sc, _) in enumerate(wedge_index) if sc == s]
+        # #     loss_s = loss(wedge_pred[:, :, mask], wedge_gt[:, :, mask])
+        # #     print(f"scale {s}: {loss_s.item():.5f}")
+        wedge_loss = loss(wedge_pred, wedge_gt)
+        print(f"Wedge loss: {wedge_loss.item():.5f}")
+        B,C,H,W = pred.shape
+        loss_re = loss(wedge_pred[:, :C,:,:], wedge_gt[:, :C,:,:])
+        loss_im = loss(wedge_pred[:, C:,:,:], wedge_gt[:, C:,:,:])
+        print(f"Wedge loss (re/im): {loss_re.item():.5f} / {loss_im.item():.5f}")
+
+
         return pred.clamp(0, 1)
 
 if __name__ == '__main__':
